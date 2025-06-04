@@ -1,0 +1,10 @@
+shiny>=1.7.0
+shinydashboard>=0.7.2
+shinyWidgets>=0.7.0
+DT>=0.24
+plotly>=4.10.0
+dplyr>=1.0.0
+readxl>=1.4.0
+openxlsx>=4.2.5
+stringr>=1.4.0
+RColorBrewer>=1.1-3
