@@ -8,7 +8,8 @@ library(readxl)
 library(openxlsx)
 library(stringr)
 library(RColorBrewer)
-
+library(DBI)
+library(RSQLite)
 # Helper functions for SSSOM compliance
 validate_sssom_mappings <- function(df) {
   required_cols <- c("subject_id", "predicate_id", "object_id")
@@ -31,23 +32,50 @@ validate_sssom_mappings <- function(df) {
   return(list(valid = TRUE, message = "SSSOM format validated successfully"))
 }
 
-convert_to_sssom <- function(df, format_type = "auto") {
+convert_to_sssom <- function(df, format_type = "auto", source_prefix_value = "CLL:", target_prefix_value = "1MG:") {
+  # Store original dataframe in case we need it
+  df_converted <- df
+  
   # Auto-detect format and convert to SSSOM
   if(format_type == "auto") {
-    if("Mapping Status" %in% colnames(df)) {
+    # Check column names to detect format
+    col_names <- colnames(df)
+    
+    # Check if it's already SSSOM format
+    if(all(c("subject_id", "predicate_id", "object_id") %in% col_names)) {
+      format_type <- "sssom"
+    }
+    # Check for legacy format columns
+    else if(all(c("Mapping Status", "CLL Variable", "1+MG Variables That Map to This") %in% col_names)) {
       format_type <- "legacy"
-    } else if("relationship" %in% colnames(df)) {
+    }
+    # Check for simple format columns
+    else if(all(c("cll_variable", "relationship", "1mg_variable") %in% col_names) ||
+            all(c("subject_variable", "relationship", "object_variable") %in% col_names)) {
+      format_type <- "simple"
+    }
+    # Default to simple if can't detect
+    else {
       format_type <- "simple"
     }
   }
   
   if(format_type == "legacy") {
     # Convert from legacy format
+    # Check if required columns exist
+    required_legacy_cols <- c("CLL Variable", "1+MG Variables That Map to This", "Mapping Status")
+    if(!all(required_legacy_cols %in% colnames(df))) {
+      stop("Legacy format requires columns: 'CLL Variable', '1+MG Variables That Map to This', 'Mapping Status'")
+    }
+    
     df_converted <- df %>%
       mutate(
-        subject_id = paste0("CLL:", str_replace_all(`CLL Variable`, " ", "_")),
-        object_id = ifelse(`1+MG Variables That Map to This` == "None" | is.na(`1+MG Variables That Map to This`), 
-                           NA, paste0("1MG:", str_replace_all(`1+MG Variables That Map to This`, " ", "_"))),
+        subject_id = paste0(source_prefix_value, str_replace_all(`CLL Variable`, " ", "_")),
+        object_id = ifelse(`1+MG Variables That Map to This` == "None" | 
+                             is.na(`1+MG Variables That Map to This`) | 
+                             `1+MG Variables That Map to This` == "", 
+                           NA, 
+                           paste0(target_prefix_value, str_replace_all(`1+MG Variables That Map to This`, " ", "_"))),
         predicate_id = case_when(
           `Mapping Status` == "Complete" ~ "skos:closeMatch",
           `Mapping Status` == "Extra" ~ "sssom:NoMatch",
@@ -61,31 +89,87 @@ convert_to_sssom <- function(df, format_type = "auto") {
           TRUE ~ 0.50
         ),
         match_type = "HumanCurated",
-        subject_class = `1+MG Class`,
-        object_class = `1+MG Class`,
-        mapping_justification = Notes
-      ) %>%
-      select(subject_id, predicate_id, object_id, confidence, match_type, subject_class, object_class, mapping_justification)
+        subject_class = ifelse("1+MG Class" %in% colnames(df), `1+MG Class`, ""),
+        object_class = ifelse("1+MG Class" %in% colnames(df), `1+MG Class`, ""),
+        mapping_justification = ifelse("Notes" %in% colnames(df), Notes, "")
+      )
+    
   } else if(format_type == "simple") {
-    # Convert from simple CSV format
+    # Convert from simple CSV/Excel format
+    # Handle different column naming conventions
+    if("cll_variable" %in% colnames(df)) {
+      subject_col <- "cll_variable"
+      object_col <- "1mg_variable"
+    } else if("subject_variable" %in% colnames(df)) {
+      subject_col <- "subject_variable"
+      object_col <- "object_variable"
+    } else if("source_variable" %in% colnames(df)) {
+      subject_col <- "source_variable"
+      object_col <- "target_variable"
+    } else {
+      # Try to find columns containing these terms
+      subject_col <- grep("subject|source|cll", colnames(df), ignore.case = TRUE, value = TRUE)[1]
+      object_col <- grep("object|target|1mg|mg", colnames(df), ignore.case = TRUE, value = TRUE)[1]
+    }
+    
+    if(is.na(subject_col) || is.na(object_col)) {
+      stop("Cannot identify source and target variable columns in simple format")
+    }
+    
+    # Check if relationship column exists
+    rel_col <- grep("relationship|relation|predicate|mapping", colnames(df), ignore.case = TRUE, value = TRUE)[1]
+    if(is.na(rel_col)) {
+      # If no relationship column, default to closeMatch
+      df$relationship <- "close_match"
+      rel_col <- "relationship"
+    }
+    
     df_converted <- df %>%
       mutate(
-        subject_id = paste0("CLL:", str_replace_all(cll_variable, " ", "_")),
-        object_id = ifelse(is.na(`1mg_variable`) | `1mg_variable` == "", 
-                           NA, paste0("1MG:", str_replace_all(`1mg_variable`, " ", "_"))),
+        subject_id = paste0(source_prefix_value, str_replace_all(!!sym(subject_col), " ", "_")),
+        object_id = ifelse(is.na(!!sym(object_col)) | !!sym(object_col) == "", 
+                           NA, 
+                           paste0(target_prefix_value, str_replace_all(!!sym(object_col), " ", "_"))),
         predicate_id = case_when(
-          str_to_lower(relationship) %in% c("exact", "exact_match") ~ "skos:exactMatch",
-          str_to_lower(relationship) %in% c("close", "close_match") ~ "skos:closeMatch",
-          str_to_lower(relationship) %in% c("broad", "broad_match") ~ "skos:broadMatch",
-          str_to_lower(relationship) %in% c("narrow", "narrow_match") ~ "skos:narrowMatch",
-          str_to_lower(relationship) %in% c("related", "related_match") ~ "skos:relatedMatch",
-          str_to_lower(relationship) %in% c("no_match", "none") ~ "sssom:NoMatch",
+          str_to_lower(!!sym(rel_col)) %in% c("exact", "exact_match", "exactmatch") ~ "skos:exactMatch",
+          str_to_lower(!!sym(rel_col)) %in% c("close", "close_match", "closematch") ~ "skos:closeMatch",
+          str_to_lower(!!sym(rel_col)) %in% c("broad", "broad_match", "broadmatch") ~ "skos:broadMatch",
+          str_to_lower(!!sym(rel_col)) %in% c("narrow", "narrow_match", "narrowmatch") ~ "skos:narrowMatch",
+          str_to_lower(!!sym(rel_col)) %in% c("related", "related_match", "relatedmatch") ~ "skos:relatedMatch",
+          str_to_lower(!!sym(rel_col)) %in% c("no_match", "nomatch", "none", "na") ~ "sssom:NoMatch",
           TRUE ~ "skos:relatedMatch"
         )
       )
+    
+    # Check for confidence column
+    conf_col <- grep("confidence|score|similarity", colnames(df), ignore.case = TRUE, value = TRUE)[1]
+    if(!is.na(conf_col)) {
+      df_converted$confidence <- as.numeric(df[[conf_col]])
+    }
+    
+    # Check for class columns
+    subj_class_col <- grep("subject_class|source_class|cll_class", colnames(df), ignore.case = TRUE, value = TRUE)[1]
+    obj_class_col <- grep("object_class|target_class|mg_class|1mg_class", colnames(df), ignore.case = TRUE, value = TRUE)[1]
+    
+    if(!is.na(subj_class_col)) {
+      df_converted$subject_class <- df[[subj_class_col]]
+    }
+    if(!is.na(obj_class_col)) {
+      df_converted$object_class <- df[[obj_class_col]]
+    }
+    
+    # Check for justification column
+    just_col <- grep("justification|reason|notes|comment", colnames(df), ignore.case = TRUE, value = TRUE)[1]
+    if(!is.na(just_col)) {
+      df_converted$mapping_justification <- df[[just_col]]
+    }
+    
+  } else if(format_type == "sssom") {
+    # Already in SSSOM format, just ensure all required columns exist
+    df_converted <- df
   }
   
-  # Ensure required columns exist
+  # Ensure all required SSSOM columns exist
   required_cols <- c("subject_id", "predicate_id", "object_id", "confidence", "match_type", 
                      "subject_class", "object_class", "mapping_justification")
   
@@ -95,58 +179,91 @@ convert_to_sssom <- function(df, format_type = "auto") {
         df_converted[[col]] <- 0.75
       } else if(col == "match_type") {
         df_converted[[col]] <- "HumanCurated"
-      } else {
+      } else if(col %in% c("subject_class", "object_class", "mapping_justification")) {
         df_converted[[col]] <- ""
       }
     }
   }
   
-  # Preserve description columns if they exist
-  if("subject_description" %in% colnames(df)) {
-    df_converted$subject_description <- df$subject_description
+  # Preserve description columns if they exist in original
+  desc_cols <- c("subject_description", "object_description", "subject_label", "object_label")
+  for(col in desc_cols) {
+    if(col %in% colnames(df) && !col %in% colnames(df_converted)) {
+      df_converted[[col]] <- df[[col]]
+    }
   }
-  if("object_description" %in% colnames(df)) {
-    df_converted$object_description <- df$object_description
+  
+  # Select only the columns we need, preserving order
+  final_cols <- c("subject_id", "predicate_id", "object_id", "confidence", "match_type", 
+                  "subject_class", "object_class", "mapping_justification")
+  
+  # Add optional columns if they exist
+  optional_cols <- c("subject_description", "object_description", "subject_label", "object_label",
+                     "author_id", "mapping_date", "subject_source", "object_source")
+  
+  for(col in optional_cols) {
+    if(col %in% colnames(df_converted)) {
+      final_cols <- c(final_cols, col)
+    }
   }
+  
+  # Return only the columns that exist
+  df_converted <- df_converted[, intersect(final_cols, colnames(df_converted)), drop = FALSE]
   
   return(df_converted)
 }
-
 # Function to extract variable data from mapping descriptions
-extract_variables_from_mappings <- function(mappings_df) {
+# Function to extract variable data from mapping descriptions
+extract_variables_from_mappings <- function(mappings_df, source_prefix_value, target_prefix_value) {
   if(!all(c("subject_description", "object_description") %in% colnames(mappings_df))) {
+    # Try alternative column names
+    if("subject_label" %in% colnames(mappings_df)) {
+      mappings_df$subject_description <- mappings_df$subject_label
+    }
+    if("object_label" %in% colnames(mappings_df)) {
+      mappings_df$object_description <- mappings_df$object_label
+    }
+    
+    # If still no description columns, return NULL
+    if(!all(c("subject_description", "object_description") %in% colnames(mappings_df))) {
+      return(NULL)
+    }
+  }
+  
+  # Extract source variables (e.g., CLL)
+  source_vars <- mappings_df %>%
+    select(subject_id, subject_class, subject_description) %>%
+    distinct() %>%
+    filter(!is.na(subject_id), !is.na(subject_description), subject_description != "") %>%
+    mutate(
+      variable_id = subject_id,
+      variable_name = str_replace(subject_id, paste0("^", source_prefix_value), ""),
+      description = subject_description,
+      class = ifelse(is.na(subject_class) | subject_class == "", "Unclassified", subject_class),
+      data_type = "unknown"
+    ) %>%
+    select(variable_id, variable_name, description, data_type, class)
+  
+  # Extract target variables (e.g., 1+MG)
+  target_vars <- mappings_df %>%
+    select(object_id, object_class, object_description) %>%
+    distinct() %>%
+    filter(!is.na(object_id), !is.na(object_description), object_description != "") %>%
+    mutate(
+      variable_id = object_id,
+      variable_name = str_replace(object_id, paste0("^", target_prefix_value), ""),
+      description = object_description,
+      class = ifelse(is.na(object_class) | object_class == "", "Unclassified", object_class),
+      data_type = "unknown"
+    ) %>%
+    select(variable_id, variable_name, description, data_type, class)
+  
+  # Return NULL if no variables were extracted
+  if(nrow(source_vars) == 0 && nrow(target_vars) == 0) {
     return(NULL)
   }
   
-  # Extract CLL variables
-  cll_vars <- mappings_df %>%
-    select(subject_id, subject_class, subject_description) %>%
-    distinct() %>%
-    filter(!is.na(subject_id)) %>%
-    mutate(
-      variable_id = subject_id,
-      variable_name = str_replace(subject_id, "CLL:", ""),
-      description = subject_description,
-      class = subject_class,
-      data_type = "unknown"
-    ) %>%
-    select(variable_id, variable_name, description, data_type, class)
-  
-  # Extract 1+MG variables
-  mg_vars <- mappings_df %>%
-    select(object_id, object_class, object_description) %>%
-    distinct() %>%
-    filter(!is.na(object_id), !is.na(object_description)) %>%
-    mutate(
-      variable_id = object_id,
-      variable_name = str_replace(object_id, "1MG:", ""),
-      description = object_description,
-      class = object_class,
-      data_type = "unknown"
-    ) %>%
-    select(variable_id, variable_name, description, data_type, class)
-  
-  return(list(cll = cll_vars, mg = mg_vars))
+  return(list(cll = source_vars, mg = target_vars))
 }
 
 create_sample_variables <- function() {
@@ -279,6 +396,20 @@ ui <- dashboardPage(
                 box(
                   title = "Choose Input Method", status = "primary", solidHeader = TRUE,
                   width = 12,
+                  fluidRow(
+                    column(4,
+                           textInput("sourceModelName", "Source Model Name:", value = "ModelA")
+                    ),
+                    column(4,
+                           textInput("targetModelName", "Target Model Name:", value = "ModelB")
+                    ),
+                    column(4,
+                           textInput("defaultAuthor", "Default Author (Name or ORCID):", 
+                                     value = "", 
+                                     placeholder = "e.g., John Doe or orcid:0000-0000-0000-0000")
+                    )
+                  ),
+                  br(),
                   radioButtons("inputMode", "Select data input approach:",
                                choices = list(
                                  "Upload Variable Lists (Create New Mappings)" = "variables",
@@ -296,12 +427,12 @@ ui <- dashboardPage(
                   box(
                     title = "Upload Variable Lists", status = "info", solidHeader = TRUE,
                     width = 6,
-                    h4("CLL Variables"),
+                    h4(textOutput("sourceModelLabel")),
                     fileInput("cllVariables", "Choose CLL Variables File",
                               accept = c(".xlsx", ".csv")),
                     p("Required columns: variable_name, description, class, data_type"),
                     
-                    h4("1+MG Variables"),
+                    h4(textOutput("targetModelLabel")),
                     fileInput("mgVariables", "Choose 1+MG Variables File",
                               accept = c(".xlsx", ".csv")),
                     p("Required columns: variable_name, description, class, data_type"),
@@ -390,7 +521,7 @@ ui <- dashboardPage(
                       condition = "output.variablesLoaded",
                       fluidRow(
                         column(4,
-                               h4("CLL Variables"),
+                               h4(textOutput("sourceModelLabel")),
                                selectInput("filterCLLClass", "Filter by Class:", choices = NULL),
                                div(style = "height: 400px; overflow-y: auto; border: 1px solid #ddd; border-radius: 4px;",
                                    DT::dataTableOutput("cllVariablesList"))
@@ -417,6 +548,9 @@ ui <- dashboardPage(
                                textAreaInput("mappingJustification", "Justification:", 
                                              placeholder = "Explain the mapping relationship...",
                                              rows = 3),
+                               textInput("mappingAuthor", "Author (Name or ORCID):", 
+                                         value = "", 
+                                         placeholder = "e.g., John Doe or orcid:0000-0000-0000-0000"),
                                br(),
                                actionButton("createMapping", "Create Mapping", class = "btn-success"),
                                actionButton("suggestJustification", "Auto-Suggest", class = "btn-info btn-sm"),
@@ -426,7 +560,7 @@ ui <- dashboardPage(
                                    verbatimTextOutput("selectedMGVar"))
                         ),
                         column(4,
-                               h4("1+MG Variables"),
+                               h4(textOutput("targetModelLabel")),
                                selectInput("filterMGClass", "Filter by Class:", choices = NULL),
                                div(style = "height: 400px; overflow-y: auto; border: 1px solid #ddd; border-radius: 4px;",
                                    DT::dataTableOutput("mgVariablesList"))
@@ -585,7 +719,6 @@ ui <- dashboardPage(
 
 # Server
 server <- function(input, output, session) {
-  
   # Reactive values
   values <- reactiveValues(
     cll_variables = NULL,
@@ -594,8 +727,127 @@ server <- function(input, output, session) {
     selected_cll_var = NULL,
     selected_mg_var = NULL,
     variables_loaded = FALSE,
-    mappings_loaded = FALSE
+    mappings_loaded = FALSE,
+    default_author = ""
   )
+  # Connect to SQLite database (must come BEFORE any dbExistsTable/dbReadTable)
+  db_path <- "sssom_mappings.sqlite"  # stored in the app directory
+  con <- dbConnect(SQLite(), dbname = db_path)
+  
+  # Create tables if they don't exist
+  dbExecute(con, "
+CREATE TABLE IF NOT EXISTS mappings (
+  subject_id TEXT,
+  predicate_id TEXT,
+  object_id TEXT,
+  confidence REAL,
+  match_type TEXT,
+  subject_class TEXT,
+  object_class TEXT,
+  mapping_justification TEXT,
+  author_id TEXT,
+  mapping_date TEXT,
+  subject_source TEXT,
+  object_source TEXT,
+  subject_description TEXT,
+  object_description TEXT
+)
+")
+
+dbExecute(con, "
+CREATE TABLE IF NOT EXISTS cll_variables (
+  variable_id TEXT,
+  variable_name TEXT,
+  description TEXT,
+  data_type TEXT,
+  class TEXT
+)
+")
+
+dbExecute(con, "
+CREATE TABLE IF NOT EXISTS mg_variables (
+  variable_id TEXT,
+  variable_name TEXT,
+  description TEXT,
+  data_type TEXT,
+  class TEXT
+)
+")
+
+# --------- THIS IS THE CORRECT WAY: PUT THIS INSIDE AN OBSERVE! ---------
+observe({
+  # Load CLL variables
+  if (dbExistsTable(con, "cll_variables")) {
+    cll_data <- dbReadTable(con, "cll_variables")
+    if (nrow(cll_data) > 0) {
+      values$cll_variables <- cll_data
+    }
+  }
+  
+  # Load MG variables
+  if (dbExistsTable(con, "mg_variables")) {
+    mg_data <- dbReadTable(con, "mg_variables")
+    if (nrow(mg_data) > 0) {
+      values$mg_variables <- mg_data
+    }
+  }
+  
+  # Load mappings
+  if (dbExistsTable(con, "mappings")) {
+    mappings_data <- dbReadTable(con, "mappings")
+    if (nrow(mappings_data) > 0) {
+      values$mappings <- mappings_data
+      values$mappings_loaded <- TRUE
+    }
+  }
+  
+  # Update UI if data was loaded
+  if (!is.null(values$cll_variables) && !is.null(values$mg_variables)) {
+    values$variables_loaded <- TRUE
+    
+    # Update filters
+    updateSelectInput(session, "filterCLLClass", 
+                      choices = c("All", unique(values$cll_variables$class)))
+    updateSelectInput(session, "filterMGClass", 
+                      choices = c("All", unique(values$mg_variables$class)))
+  }
+  
+  if (values$mappings_loaded && "subject_class" %in% colnames(values$mappings)) {
+    updateSelectInput(session, "selectedClass",
+                      choices = unique(values$mappings$subject_class))
+  }
+})
+
+# Close database connection when app stops
+onStop(function() {
+  dbDisconnect(con)
+})
+
+source_prefix <- reactive({ paste0(input$sourceModelName, ":") })
+target_prefix <- reactive({ paste0(input$targetModelName, ":") })
+  
+  
+  output$sourceModelLabel <- renderText({
+    paste(input$sourceModelName, "Variables")
+  })
+  
+  output$targetModelLabel <- renderText({
+    paste(input$targetModelName, "Variables")
+  })
+  
+  # Add this observer to handle default author
+  observeEvent(input$defaultAuthor, {
+    if(input$defaultAuthor != "") {
+      updateTextInput(session, "mappingAuthor", value = input$defaultAuthor)
+    }
+  })
+  
+  # Also update when variables are loaded
+  observeEvent(values$variables_loaded, {
+    if(values$variables_loaded && input$defaultAuthor != "") {
+      updateTextInput(session, "mappingAuthor", value = input$defaultAuthor)
+    }
+  })
   
   # Load sample data
   observeEvent(input$loadSampleData, {
@@ -636,6 +888,10 @@ server <- function(input, output, session) {
       }
       
       values$variables_loaded <- TRUE
+      # Save uploaded variables to SQLite
+      dbWriteTable(con, "cll_variables", values$cll_variables, overwrite = TRUE)
+      dbWriteTable(con, "mg_variables", values$mg_variables, overwrite = TRUE)
+      
       values$mappings <- data.frame()  # Initialize empty mappings
       
       # Update class filters
@@ -652,6 +908,7 @@ server <- function(input, output, session) {
   })
   
   # Load mappings
+  # Load mappings - FIXED version
   observeEvent(input$loadMappings, {
     req(input$mappingFile)
     
@@ -671,20 +928,33 @@ server <- function(input, output, session) {
       
       # Convert to SSSOM format if needed
       if(input$mappingFormat != "sssom") {
-        values$mappings <- convert_to_sssom(raw_mappings, input$mappingFormat)
+        values$mappings <- convert_to_sssom(raw_mappings, input$mappingFormat, source_prefix(), target_prefix())
       } else {
         values$mappings <- raw_mappings
       }
       
       values$mappings_loaded <- TRUE
       
+      # Save mappings to database
+      if(!is.null(values$mappings) && nrow(values$mappings) > 0) {
+        dbWriteTable(con, "mappings", values$mappings, overwrite = TRUE, row.names = FALSE)
+      }
+      
       # Try to extract variable definitions from mapping descriptions
       if(all(c("subject_description", "object_description") %in% colnames(values$mappings))) {
-        extracted_vars <- extract_variables_from_mappings(values$mappings)
+        extracted_vars <- extract_variables_from_mappings(values$mappings, source_prefix(), target_prefix())
         if(!is.null(extracted_vars)) {
           values$cll_variables <- extracted_vars$cll
           values$mg_variables <- extracted_vars$mg
           values$variables_loaded <- TRUE
+          
+          # Save extracted variables to database
+          if(nrow(extracted_vars$cll) > 0) {
+            dbWriteTable(con, "cll_variables", extracted_vars$cll, overwrite = TRUE, row.names = FALSE)
+          }
+          if(nrow(extracted_vars$mg) > 0) {
+            dbWriteTable(con, "mg_variables", extracted_vars$mg, overwrite = TRUE, row.names = FALSE)
+          }
           
           # Update class filters for interactive mapping
           updateSelectInput(session, "filterCLLClass", 
@@ -913,26 +1183,39 @@ server <- function(input, output, session) {
   })
   
   # Create mapping
+  # Create mapping - FIXED version
   observeEvent(input$createMapping, {
     req(values$selected_cll_var, input$mappingPredicate, input$mappingConfidence)
     
+    # Get author value, use default if empty
+    author_value <- if(input$mappingAuthor != "") {
+      input$mappingAuthor
+    } else {
+      "dashboard_user"
+    }
+    
+    # Format ORCID if it's just numbers
+    if(grepl("^[0-9]{4}-[0-9]{4}-[0-9]{4}-[0-9]{4}$", author_value)) {
+      author_value <- paste0("orcid:", author_value)
+    }
+    
     new_mapping <- data.frame(
-      subject_id = paste0("CLL:", values$selected_cll_var$variable_name),
+      subject_id = paste0(source_prefix(), values$selected_cll_var$variable_name),
       predicate_id = input$mappingPredicate,
       object_id = if(input$mappingPredicate == "sssom:NoMatch" || is.null(values$selected_mg_var)) {
         NA
       } else {
-        paste0("1MG:", values$selected_mg_var$variable_name)
+        paste0(target_prefix(), values$selected_mg_var$variable_name)
       },
       confidence = input$mappingConfidence,
       match_type = "HumanCurated",
       subject_class = values$selected_cll_var$class,
       object_class = if(is.null(values$selected_mg_var)) NA else values$selected_mg_var$class,
       mapping_justification = if(input$mappingJustification == "") "User created mapping" else input$mappingJustification,
-      author_id = "dashboard_user",
+      author_id = author_value,
       mapping_date = as.character(Sys.Date()),
-      subject_source = "CLL_Registry",
-      object_source = "1MG_Standard",
+      subject_source = input$sourceModelName,
+      object_source = input$targetModelName,
       subject_description = values$selected_cll_var$description,
       object_description = if(is.null(values$selected_mg_var)) NA else values$selected_mg_var$description,
       stringsAsFactors = FALSE
@@ -940,11 +1223,20 @@ server <- function(input, output, session) {
     
     if(is.null(values$mappings) || nrow(values$mappings) == 0) {
       values$mappings <- new_mapping
+      # Write the first mapping to database (overwrite)
+      dbWriteTable(con, "mappings", new_mapping, overwrite = TRUE, row.names = FALSE)
     } else {
       values$mappings <- rbind(values$mappings, new_mapping)
+      # Append subsequent mappings to database
+      dbWriteTable(con, "mappings", new_mapping, append = TRUE, row.names = FALSE)
     }
     
     values$mappings_loaded <- TRUE
+    
+    # Store the author for reuse if it's not empty
+    if(input$mappingAuthor != "") {
+      values$default_author <- input$mappingAuthor
+    }
     
     # Clear selections
     values$selected_cll_var <- NULL
@@ -962,6 +1254,11 @@ server <- function(input, output, session) {
   observeEvent(input$clearMappings, {
     values$mappings <- data.frame()
     values$mappings_loaded <- FALSE
+    # Optional: clear DB as well
+    dbExecute(con, "DELETE FROM mappings")
+    dbExecute(con, "DELETE FROM cll_variables")
+    dbExecute(con, "DELETE FROM mg_variables")
+  
     showNotification("All mappings cleared", type = "warning")
   })
   
@@ -971,12 +1268,13 @@ server <- function(input, output, session) {
     
     display_data <- values$mappings %>%
       mutate(
-        CLL_Variable = str_replace(subject_id, "CLL:", ""),
-        MG_Variable = ifelse(is.na(object_id), "-", str_replace(object_id, "1MG:", "")),
+        CLL_Variable = str_replace(subject_id, source_prefix(), ""),
+        MG_Variable = ifelse(is.na(object_id), "-", str_replace(object_id, target_prefix(), "")),
         Relationship = str_replace(predicate_id, "skos:|sssom:", ""),
-        Confidence = round(confidence, 2)
+        Confidence = round(confidence, 2),
+        Author = author_id  # Add author to display
       ) %>%
-      select(CLL_Variable, Relationship, MG_Variable, Confidence, subject_class, mapping_justification)
+      select(CLL_Variable, Relationship, MG_Variable, Confidence, Author, subject_class, mapping_justification)
     
     DT::datatable(display_data,
                   options = list(pageLength = 10, scrollX = TRUE),
@@ -1011,7 +1309,7 @@ server <- function(input, output, session) {
     class_mappings <- values$mappings %>%
       filter(subject_class == input$selectedClass) %>%
       mutate(
-        CLL_Variable = str_replace(subject_id, "CLL:", ""),
+        CLL_Variable = str_replace(subject_id, source_prefix(), ""),
         Relationship = case_when(
           predicate_id == "skos:exactMatch" ~ "Exact Match",
           predicate_id == "skos:closeMatch" ~ "Close Match",
@@ -1021,7 +1319,7 @@ server <- function(input, output, session) {
           predicate_id == "sssom:NoMatch" ~ "No Match",
           TRUE ~ str_replace(predicate_id, "skos:|sssom:", "")
         ),
-        MG_Variable = ifelse(is.na(object_id), "-", str_replace(object_id, "1MG:", "")),
+        MG_Variable = ifelse(is.na(object_id), "-", str_replace(object_id, target_prefix(), "")),
         Confidence = ifelse(is.na(confidence), "-", as.character(round(confidence, 2)))
       ) %>%
       select(CLL_Variable, Relationship, MG_Variable, Confidence, mapping_justification)
@@ -1076,7 +1374,7 @@ server <- function(input, output, session) {
           column(6,
                  h4("CLL Variable Details"),
                  div(class = "description-box",
-                     p(strong("Variable ID:"), str_replace(selected_mapping$subject_id, "CLL:", "")),
+                     p(strong("Variable ID:"), str_replace(selected_mapping$subject_id, source_prefix(), "")),
                      p(strong("Class:"), selected_mapping$subject_class),
                      p(strong("Description:"), subject_desc)
                  )
@@ -1084,7 +1382,7 @@ server <- function(input, output, session) {
           column(6,
                  h4("1+MG Variable Details"),
                  div(class = "description-box", style = "border-left-color: #28a745;",
-                     p(strong("Variable ID:"), ifelse(is.na(selected_mapping$object_id), "No match", str_replace(selected_mapping$object_id, "1MG:", ""))),
+                     p(strong("Variable ID:"), ifelse(is.na(selected_mapping$object_id), "No match", str_replace(selected_mapping$object_id, target_prefix(), ""))),
                      p(strong("Class:"), ifelse(is.na(selected_mapping$object_class), "-", selected_mapping$object_class)),
                      p(strong("Description:"), object_desc)
                  )
@@ -1285,8 +1583,8 @@ server <- function(input, output, session) {
         paste0("# mapping_date: ", Sys.Date()),
         paste0("# license: ", input$exportLicense),
         paste0("# creator_id: ", input$exportCreator),
-        "# subject_source: CLL_Registry",
-        "# object_source: 1MG_Standard",
+        paste0("# subject_source: ", input$sourceModelName),
+        paste0("# object_source: ", input$targetModelName),
         ""
       )
       
