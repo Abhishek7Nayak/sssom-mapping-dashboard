@@ -66,16 +66,16 @@ Built to accelerate harmonization projects, the dashboard is ideal for ontologis
 1. **Load Variable Lists or Existing Mappings**
    - **Upload variable lists:** Start from scratch by uploading CSV or Excel files describing your source and target variables.
    - **Upload existing mappings:** Import previously created SSSOM, legacy, or simple-format mapping files for visualization or further editing.
-
+    ![Data Input Screenshot](screenshots/Data%20Input.png)
 2. **Interactive Mapping (Variables mode)**
    - Select variables from each model, specify the mapping relationship, confidence, and justification, and add mappings one by one.
-
+    ![Interactive Mapping Screenshot](screenshots/Interactive%20Mapping.png)
 3. **Visualization & Analysis**
    - Use the Class Explorer and Mapping Analysis tabs to explore predicate distributions, class mapping coverage, and confidence scores.
-
+    ![Class Explorer](screenshots/Class%20explorer.png)
 4. **Export**
    - Download your completed mappings as SSSOM TSV (with full metadata), Excel, or as an HTML summary report for documentation and sharing.
-
+    ![Export](screenshots/Export.png)
 ---
 
 ## 📂 File Formats Supported
