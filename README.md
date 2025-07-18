@@ -73,6 +73,7 @@ Built to accelerate harmonization projects, the dashboard is ideal for ontologis
 3. **Visualization & Analysis**
    - Use the Class Explorer and Mapping Analysis tabs to explore predicate distributions, class mapping coverage, and confidence scores.
     ![Class Explorer](screenshots/Class%20explorer.png)
+    ![Mapping Analysis](screenshots/Mapping%20Analysis.png)
 4. **Export**
    - Download your completed mappings as SSSOM TSV (with full metadata), Excel, or as an HTML summary report for documentation and sharing.
     ![Export](screenshots/Export.png)
